@@ -1,0 +1,276 @@
+{
+    "Description": "CloudFormation template for creating an EMR cluster and an Edge node with RStudio Server",
+    "Parameters": {
+        "VPC": {
+            "Description": "VPC ID for creating the Amazon EMR cluster & RStudio Server",
+            "Type": "AWS::EC2::VPC::Id"
+        },
+        "RStudioServerSubnet": {
+            "Description": "Public subnet for the RStudio server & Edge node",
+            "Type": "AWS::EC2::Subnet::Id"
+        },
+        "EmrSubnet": {
+            "Description": "Subnet for the Amazon EMR cluster (it can be either private or public)",
+            "Type": "AWS::EC2::Subnet::Id"
+        },
+        "KeyName": {
+            "Description": "Name of an existing EC2 KeyPair to enable SSH to the instances",
+            "Type": "AWS::EC2::KeyPair::KeyName"
+        },
+        "InstanceType": {
+            "Description": "Instance type of the RStudio Server",
+            "Type": "String",
+            "Default": "m4.xlarge",
+            "AllowedValues": [
+                "t2.medium",
+                "t2.large",
+                "t2.xlarge",
+                "m5.large",
+                "m5.xlarge",
+                "m5.2xlarge",
+                "m5.4xlarge",
+                "m4.large",
+                "m4.xlarge",
+                "m4.2xlarge",
+                "m4.4xlarge"
+            ],
+            "ConstraintDescription": "must be a valid EC2 instance type."
+        },
+        "s3RepoPath": {
+            "Default": "aws-data-analytics-blog/rstudio-edge-node",
+            "Description": "S3 repo path which contains this blog related files",
+            "Type": "String"
+        },
+        "s3TempUploadPath": {
+            "Description": "Path where dependency & Hive sample files will be stored temporarily",
+            "Type": "String",
+            "AllowedPattern": "^s3://([^/]+)(.*?([^/]+)/?)$"
+        }
+    },
+    "Resources": {
+        "EMRCluster":{
+            "Type":"AWS::EMR::Cluster",
+            "Properties":{
+                "Name":"EMR-For-RStudio-Server",
+                "JobFlowRole":"EMR_EC2_DefaultRole",
+                "ServiceRole":"EMR_DefaultRole",
+                "ReleaseLabel":"emr-5.16.0",
+                "VisibleToAllUsers":"true",
+                "Instances": {
+                    "TerminationProtected": false,
+                    "Ec2KeyName": { "Ref": "KeyName" },
+                    "Ec2SubnetId": { "Ref": "EmrSubnet" },
+                    "MasterInstanceGroup": {
+                        "InstanceCount": 1,
+                        "InstanceType": "m4.xlarge",
+                        "Market": "ON_DEMAND",
+                        "Name": "Master"
+                    },
+                    "CoreInstanceGroup": {
+                        "InstanceCount": 3,
+                        "InstanceType": "m4.2xlarge",
+                        "Market": "ON_DEMAND",
+                        "Name": "Core"
+                    },
+                    "AdditionalMasterSecurityGroups": [{ "Ref" : "RStudioToEMRSecGroup" }],
+                    "AdditionalSlaveSecurityGroups": [{ "Ref" : "RStudioToEMRSecGroup" }]
+                },
+                "Applications":[
+                    { "Name":"Hadoop" },
+                    { "Name":"Livy" },
+                    { "Name":"Spark" },
+                    { "Name":"Hive" }
+                ],
+                "Tags":[{
+                    "Key":"Name",
+                    "Value":"EMR-For-RStudio-Server"
+                }]
+            }
+        },
+        "CreateHiveTables": {
+            "Type": "AWS::EMR::Step",
+            "Properties": {
+                "Name": "CreateHiveTables",
+                "ActionOnFailure": "CANCEL_AND_WAIT",
+                "HadoopJarStep": {
+                    "Args": [ "s3://aws-data-analytics-blog/rstudio-edge-node/scripts/create-hive-tables.sh",
+                            { 
+                              "Ref" : "s3TempUploadPath" 
+                            }
+                    ],
+                    "Jar": "s3://elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "MainClass": ""
+                },
+                "JobFlowId": {
+                    "Ref": "EMRCluster"
+                }
+            }
+        },
+        "CreateEMRClientDeps": {
+            "Type": "AWS::EMR::Step",
+            "Properties": {
+                "Name": "CreateEMRClientDeps",
+                "ActionOnFailure": "CANCEL_AND_WAIT",
+                "HadoopJarStep": {
+                    "Args": [ "s3://aws-data-analytics-blog/rstudio-edge-node/scripts/create-emr-client.sh",
+                            { 
+                              "Ref" : "s3TempUploadPath" 
+                            }
+                    ],
+                    "Jar": "s3://elasticmapreduce/libs/script-runner/script-runner.jar",
+                    "MainClass": ""
+                },
+                "JobFlowId": {
+                    "Ref": "EMRCluster"
+                }
+            }
+        },
+        "RStudioSecGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "Open-up ports for RStudio Server",
+                "GroupName": "rstudio-server-sec-group",
+                "VpcId": { "Ref": "VPC" },
+                "SecurityGroupIngress": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": "8787",
+                    "ToPort": "8787",
+                    "CidrIp": "0.0.0.0/0"
+                },{
+                    "IpProtocol": "tcp",
+                    "FromPort": "22",
+                    "ToPort": "22",
+                    "CidrIp": "0.0.0.0/0"
+                }]
+            }
+        },
+        "RStudioToEMRSecGroup":{
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties" : { 
+                "VpcId" : { "Ref" : "VPC" },
+                "GroupName": "rstudio-to-emr-sec-group",
+                "GroupDescription" : "Security group to connect from RStudio Server to EMR",
+                "SecurityGroupIngress" : [{
+                    "IpProtocol" : "tcp",
+                    "FromPort"   : 0,
+                    "ToPort"     : 65535,
+                    "SourceSecurityGroupId"     : { "Ref": "RStudioSecGroup" }
+                }]
+            }
+        },
+        "SecGroupSelfIngress" : {
+             "Type" : "AWS::EC2::SecurityGroupIngress",
+             "Properties" : {
+                 "GroupId" : { "Ref" : "RStudioToEMRSecGroup" },
+                 "IpProtocol" : "tcp",
+                 "ToPort" : "65535",
+                 "FromPort" : "0",
+                 "SourceSecurityGroupId" : { "Ref" : "RStudioToEMRSecGroup" }
+             },
+             "DependsOn" : "RStudioToEMRSecGroup"
+        },
+        "RStudioInstanceProfile" : {
+            "Type" : "AWS::IAM::InstanceProfile",
+            "Properties" : {
+                "Path" : "/",
+                "Roles" : ["EMR_EC2_DefaultRole"]
+            }
+        },
+        "RStudioEIP" : {
+            "Type" : "AWS::EC2::EIP",
+            "Properties" : { "InstanceId" : { "Ref" : "RStudioServerEc2" }}
+        },
+        "RStudioWaitHandle" : {
+            "Type" : "AWS::CloudFormation::WaitConditionHandle",
+            "Properties" : {
+            }
+        },
+        "RStudioConfigureWaitCondition" : {
+            "Type" : "AWS::CloudFormation::WaitCondition",
+            "DependsOn" : "RStudioServerEc2",
+            "Properties" : {
+                "Handle" : { "Ref" : "RStudioWaitHandle" },
+                 "Timeout" : "1800"
+            }
+        },
+        "RStudioServerEc2": {
+            "Type": "AWS::EC2::Instance",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+                    "configSets": {
+                        "InstallRStudio": [ "RStudioCommand" ]
+                    },
+                    "RStudioCommand": {
+                        "commands" : {
+                            "installrstudio" : {
+                                "command" : {
+                                    "Fn::Join": [
+                                        "",
+                                        [
+                                          "bash /tmp/install-client-and-rstudio.sh ",
+                                          {
+                                            "Ref": "s3RepoPath"
+                                          },
+                                          " ",
+                                          {
+                                            "Ref": "s3TempUploadPath"
+                                          },
+                                          " '",
+                                          {
+                                            "Ref": "RStudioWaitHandle"
+                                          },
+                                          "' > edge-node-rstudio-isntallation.log \n"
+                                        ]
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "Properties": {
+                "SubnetId" : {"Ref": "RStudioServerSubnet"},
+                "SecurityGroupIds": [ { "Ref": "RStudioSecGroup" }, { "Ref": "RStudioToEMRSecGroup" }],
+                "ImageId": "ami-467ca739",
+                "InstanceType": { "Ref" : "InstanceType" },
+                "KeyName": { "Ref": "KeyName" },
+                "IamInstanceProfile" : {"Ref" : "RStudioInstanceProfile"},
+                "UserData": {
+                    "Fn::Base64": {
+                        "Fn::Join": [
+                            "",
+                                [
+                                "#!/bin/bash\n",
+                                "cd /tmp\n",
+                                "wget https://s3.amazonaws.com/", 
+                                    {"Ref": "s3RepoPath"},
+                                 "/scripts/install-client-and-rstudio.sh\n",
+                                 "yum update aws-cfn-bootstrap\n",
+                                 "# Install the files and packages from the metadata\n",
+                                 "/opt/aws/bin/cfn-init ",
+                                 "         --stack ", { "Ref" : "AWS::StackName" },
+                                 "         --resource RStudioServerEc2 ",
+                                 "         --configsets InstallRStudio ",
+                                 "         --region ", { "Ref" : "AWS::Region" }, "\n"
+                                ]
+                        ]
+                    }
+                },
+                "Tags" : [ {
+                    "Key" : "Name",
+                    "Value" : "RStudioServer"
+                } ]
+            }
+        }
+    },
+    "Outputs" : {
+        "RStudioServerAddress" : {
+            "Description" : "RStudio Server Address",
+            "Value":  { "Fn::Join":[ "", [ "http://", {"Fn::GetAtt" : [ "RStudioServerEc2" , "PublicDnsName" ]}, ":", "8787" ]] }
+        },
+        "EMRMasterDNS" : {
+            "Description" : "EMR Master DNS",
+            "Value":  {"Fn::GetAtt" : [ "EMRCluster" , "MasterPublicDNS" ]}
+        }
+    }
+}
